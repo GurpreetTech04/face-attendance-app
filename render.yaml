@@ -2,8 +2,6 @@ services:
   - type: web
     name: face-attendance-app
     runtime: python
-    region: oregon
-    plan: free
     buildCommand: |
       apt-get update && apt-get install -y \
         cmake \
@@ -21,12 +19,6 @@ services:
     startCommand: gunicorn app:app --workers 1 --threads 2 --timeout 120
     envVars:
       - key: PYTHON_VERSION
-        value: 3.9.18
+        value: 3.11.9
       - key: PYTHONUNBUFFERED
         value: true
-    healthCheckPath: /health
-    autoDeploy: true
-    disk:
-      name: attendance-data
-      mountPath: /opt/render/project/src
-      sizeGB: 1
