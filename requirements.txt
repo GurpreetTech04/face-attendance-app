@@ -1,0 +1,16 @@
+numpy
+opencv-python
+face_recognition
+dlib
+os
+cmake
+json
+pygame
+datetime
+flask
+psutil
+pandas
+sys
+time
+subprocess
+signal
