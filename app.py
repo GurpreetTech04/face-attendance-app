@@ -1,233 +1,243 @@
-# app.py - Updated with better path handling
+import os
 import cv2
 import numpy as np
 import face_recognition
-import os
-from datetime import datetime
+import csv
 import json
-from flask import Flask, render_template, jsonify, request, send_file
-import time
-import subprocess
-import signal
-import psutil
-import pandas as pd
-import sys
+from datetime import datetime
+from flask import Flask, render_template, request, jsonify, send_file
+import base64
+from io import BytesIO
+from PIL import Image
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Get absolute paths
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SCRIPT_TO_RUN = os.path.join(BASE_DIR, 'main.py')
-PYTHON_EXECUTABLE = sys.executable
-IMAGES_PATH = os.path.join(BASE_DIR, 'images')
-ATTENDANCE_FILE = os.path.join(BASE_DIR, 'attendance.csv')
+# Configuration
+IMAGES_FOLDER = 'images'
+ATTENDANCE_FILE = 'attendance.csv'
+JSON_FILE = 'attendance.json'
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
 
-# Global variable
-BACKGROUND_PROCESS = None
+# Create images folder if it doesn't exist
+os.makedirs(IMAGES_FOLDER, exist_ok=True)
 
-# Ensure directories exist
-os.makedirs(IMAGES_PATH, exist_ok=True)
+# Load known faces
+def load_known_faces():
+    """Load all face images from the images folder and encode them"""
+    known_face_encodings = []
+    known_face_names = []
+    
+    if not os.path.exists(IMAGES_FOLDER):
+        logger.warning(f"Images folder '{IMAGES_FOLDER}' does not exist")
+        return known_face_encodings, known_face_names
+    
+    for filename in os.listdir(IMAGES_FOLDER):
+        if any(filename.lower().endswith(ext) for ext in ALLOWED_EXTENSIONS):
+            try:
+                # Load image
+                image_path = os.path.join(IMAGES_FOLDER, filename)
+                image = face_recognition.load_image_file(image_path)
+                
+                # Get face encodings
+                face_encodings = face_recognition.face_encodings(image)
+                
+                if face_encodings:
+                    # Use the first face found
+                    known_face_encodings.append(face_encodings[0])
+                    # Use filename without extension as name
+                    name = os.path.splitext(filename)[0]
+                    known_face_names.append(name)
+                    logger.info(f"Loaded face: {name}")
+                else:
+                    logger.warning(f"No face found in {filename}")
+            except Exception as e:
+                logger.error(f"Error loading {filename}: {str(e)}")
+    
+    logger.info(f"Loaded {len(known_face_names)} known faces")
+    return known_face_encodings, known_face_names
 
-def find_attendance_process():
-    """Finds the PID of the running attendance script"""
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-        try:
-            cmdline_args = proc.info.get('cmdline')
-            if isinstance(cmdline_args, list):
-                cmd_str = ' '.join(cmdline_args).lower()
-                if 'main.py' in cmd_str and 'python' in cmd_str:
-                    return proc.pid
-        except:
-            pass
-    return None
+# Load faces at startup
+known_face_encodings, known_face_names = load_known_faces()
 
-def read_attendance_data():
-    """Read attendance data from CSV safely"""
-    try:
-        if not os.path.exists(ATTENDANCE_FILE):
-            return []
-        
-        if os.path.getsize(ATTENDANCE_FILE) == 0:
-            return []
-        
-        df = pd.read_csv(ATTENDANCE_FILE)
-        return df.to_dict('records') if not df.empty else []
-    except Exception as e:
-        print(f"Error reading attendance: {e}")
-        return []
-
-def get_students_list():
-    """Get list of registered students"""
-    students = []
-    if os.path.exists(IMAGES_PATH):
-        for file in os.listdir(IMAGES_PATH):
-            if file.lower().endswith(('.jpg', '.jpeg', '.png')):
-                students.append(os.path.splitext(file)[0])
-    return students
+def mark_attendance(name):
+    """Mark attendance in CSV and JSON files"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    date = datetime.now().strftime("%Y-%m-%d")
+    
+    # Check if already marked today (simple check - in production use database)
+    if os.path.exists(ATTENDANCE_FILE):
+        with open(ATTENDANCE_FILE, 'r') as f:
+            reader = csv.reader(f)
+            next(reader)  # Skip header
+            for row in reader:
+                if len(row) >= 2 and row[0] == name and row[1].startswith(date):
+                    logger.info(f"{name} already marked attendance today")
+                    return False
+    
+    # Mark in CSV
+    file_exists = os.path.isfile(ATTENDANCE_FILE)
+    with open(ATTENDANCE_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(['Name', 'Timestamp'])
+        writer.writerow([name, timestamp])
+    
+    # Mark in JSON
+    attendance_data = []
+    if os.path.exists(JSON_FILE):
+        with open(JSON_FILE, 'r') as f:
+            try:
+                attendance_data = json.load(f)
+            except json.JSONDecodeError:
+                attendance_data = []
+    
+    attendance_data.append({
+        'name': name,
+        'timestamp': timestamp,
+        'date': date
+    })
+    
+    with open(JSON_FILE, 'w') as f:
+        json.dump(attendance_data, f, indent=2)
+    
+    logger.info(f"Marked attendance for {name} at {timestamp}")
+    return True
 
 @app.route('/')
 def index():
+    """Render the main page"""
     return render_template('index.html')
 
-@app.route('/api/start_attendance', methods=['POST'])
-def start_attendance():
-    global BACKGROUND_PROCESS
-    
-    # Check if already running
-    existing_pid = find_attendance_process()
-    if existing_pid:
-        return jsonify({
-            'status': 'already_running', 
-            'pid': existing_pid,
-            'message': 'System already running'
-        })
-
+@app.route('/capture', methods=['POST'])
+def capture():
+    """Handle captured image from webcam"""
     try:
-        print("\n" + "="*50)
-        print("STARTING ATTENDANCE SYSTEM")
-        print("="*50)
-        print(f"Base dir: {BASE_DIR}")
-        print(f"Script: {SCRIPT_TO_RUN}")
-        print(f"Images: {IMAGES_PATH}")
-        print(f"CSV: {ATTENDANCE_FILE}")
+        # Get image data from request
+        data = request.json
+        if not data or 'image' not in data:
+            return jsonify({'status': 'error', 'message': 'No image data received'}), 400
         
-        command = [PYTHON_EXECUTABLE, SCRIPT_TO_RUN]
-        env = os.environ.copy()
+        # Extract base64 image data
+        image_data = data['image']
+        if ',' in image_data:
+            image_data = image_data.split(',')[1]
         
-        if sys.platform == 'win32':
-            BACKGROUND_PROCESS = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-                creationflags=subprocess.CREATE_NEW_CONSOLE,
-                cwd=BASE_DIR  # Important: Set working directory
-            )
-        else:
-            BACKGROUND_PROCESS = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-                cwd=BASE_DIR
-            )
+        # Decode base64 to image
+        image_bytes = base64.b64decode(image_data)
         
-        print(f"Process started with PID: {BACKGROUND_PROCESS.pid}")
-        print("="*50 + "\n")
+        # Convert to numpy array
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
-        time.sleep(3)
+        if img is None:
+            return jsonify({'status': 'error', 'message': 'Failed to decode image'}), 400
         
-        return jsonify({
-            'status': 'running', 
-            'pid': BACKGROUND_PROCESS.pid,
-            'message': 'System started'
-        })
-
-    except Exception as e:
-        print(f"Error: {e}")
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-@app.route('/api/stop_attendance', methods=['POST'])
-def stop_attendance():
-    global BACKGROUND_PROCESS
-    
-    pid_to_stop = None
-    if BACKGROUND_PROCESS and BACKGROUND_PROCESS.poll() is None:
-        pid_to_stop = BACKGROUND_PROCESS.pid
-    
-    if not pid_to_stop:
-        pid_to_stop = find_attendance_process()
-    
-    if pid_to_stop:
-        try:
-            if sys.platform == 'win32':
-                subprocess.run(['taskkill', '/F', '/PID', str(pid_to_stop)], 
-                             capture_output=True)
+        # Convert BGR to RGB (face_recognition uses RGB)
+        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Find faces in the image
+        face_locations = face_recognition.face_locations(rgb_img)
+        
+        if not face_locations:
+            return jsonify({'status': 'error', 'message': 'No face detected in image'})
+        
+        # Get face encodings
+        face_encodings = face_recognition.face_encodings(rgb_img, face_locations)
+        
+        if not face_encodings:
+            return jsonify({'status': 'error', 'message': 'Could not encode face'})
+        
+        # Compare with known faces
+        matches = []
+        names = []
+        
+        for face_encoding in face_encodings:
+            if known_face_encodings:
+                # Compare with all known faces
+                distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+                best_match_index = np.argmin(distances)
+                
+                # Threshold for face matching (lower = stricter)
+                if distances[best_match_index] < 0.6:
+                    name = known_face_names[best_match_index]
+                    names.append(name)
+                    matches.append(True)
+                else:
+                    names.append("Unknown")
+                    matches.append(False)
             else:
-                os.kill(pid_to_stop, signal.SIGTERM)
+                names.append("No known faces")
+                matches.append(False)
+        
+        # Mark attendance for the first recognized face
+        result = {'status': 'success', 'matches': []}
+        
+        for i, name in enumerate(names):
+            match_result = {
+                'name': name,
+                'recognized': name not in ["Unknown", "No known faces"]
+            }
             
-            BACKGROUND_PROCESS = None
-            return jsonify({'status': 'stopped', 'message': 'System stopped'})
-        except Exception as e:
-            return jsonify({'status': 'error', 'message': str(e)}), 500
+            if match_result['recognized']:
+                # Mark attendance
+                marked = mark_attendance(name)
+                match_result['attendance_marked'] = marked
+                match_result['message'] = f"Attendance marked for {name}" if marked else f"{name} already marked today"
+            else:
+                match_result['attendance_marked'] = False
+                match_result['message'] = f"Face not recognized as {name}" if name == "Unknown" else "No reference faces in database"
+            
+            result['matches'].append(match_result)
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"Error in capture: {str(e)}", exc_info=True)
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/attendance')
+def view_attendance():
+    """View attendance records"""
+    attendance_data = []
+    if os.path.exists(JSON_FILE):
+        with open(JSON_FILE, 'r') as f:
+            try:
+                attendance_data = json.load(f)
+            except json.JSONDecodeError:
+                attendance_data = []
+    
+    return jsonify(attendance_data)
+
+@app.route('/download-attendance')
+def download_attendance():
+    """Download attendance CSV file"""
+    if os.path.exists(ATTENDANCE_FILE):
+        return send_file(ATTENDANCE_FILE, as_attachment=True)
     else:
-        return jsonify({'status': 'not_running'})
+        return jsonify({'error': 'No attendance file found'}), 404
 
-@app.route('/api/status', methods=['GET'])
-def status_attendance():
-    if BACKGROUND_PROCESS and BACKGROUND_PROCESS.poll() is None:
-        return jsonify({'status': 'running', 'pid': BACKGROUND_PROCESS.pid})
-    
-    pid = find_attendance_process()
-    if pid:
-        return jsonify({'status': 'running', 'pid': pid})
-    
-    return jsonify({'status': 'stopped'})
+@app.route('/faces')
+def list_faces():
+    """List all known faces"""
+    return jsonify({
+        'count': len(known_face_names),
+        'names': known_face_names
+    })
 
-@app.route('/api/attendance/today', methods=['GET'])
-def get_today_attendance():
-    try:
-        data = read_attendance_data()
-        today = datetime.now().strftime('%Y-%m-%d')
-        today_data = [r for r in data if r.get('Date') == today]
-        return jsonify({'status': 'success', 'data': today_data, 'count': len(today_data)})
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-@app.route('/api/attendance/all', methods=['GET'])
-def get_all_attendance():
-    try:
-        data = read_attendance_data()
-        return jsonify({'status': 'success', 'data': data, 'count': len(data)})
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-@app.route('/api/students', methods=['GET'])
-def get_students():
-    try:
-        students = get_students_list()
-        return jsonify({'status': 'success', 'data': students, 'count': len(students)})
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-@app.route('/api/stats', methods=['GET'])
-def get_stats():
-    try:
-        data = read_attendance_data()
-        students = get_students_list()
-        
-        if not data:
-            return jsonify({
-                'total_students': len(students),
-                'total_records': 0,
-                'today_count': 0,
-                'unique_students': 0
-            })
-        
-        df = pd.DataFrame(data)
-        today = datetime.now().strftime('%Y-%m-%d')
-        
-        stats = {
-            'total_students': len(students),
-            'total_records': len(df),
-            'today_count': len(df[df['Date'] == today]) if 'Date' in df.columns else 0,
-            'unique_students': df['Name'].nunique() if 'Name' in df.columns else 0
-        }
-        
-        return jsonify(stats)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+@app.route('/health')
+def health():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'faces_loaded': len(known_face_names),
+        'attendance_file_exists': os.path.exists(ATTENDANCE_FILE)
+    })
 
 if __name__ == '__main__':
-    print("="*50)
-    print("FACE ATTENDANCE SYSTEM - FLASK SERVER")
-    print("="*50)
-    print(f"Base directory: {BASE_DIR}")
-    print(f"Images: {IMAGES_PATH}")
-    print(f"CSV: {ATTENDANCE_FILE}")
-    print(f"Python: {PYTHON_EXECUTABLE}")
-    print("="*50)
-    print("Server: http://localhost:5000")
-    print("="*50)
-    
-    app.run(debug=True, host='127.0.0.1', port=5000)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
