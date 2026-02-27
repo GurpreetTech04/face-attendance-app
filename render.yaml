@@ -7,7 +7,7 @@ projects:
     services:
     - type: web
       name: face-attendance-app
-      runtime: python
+      runtime: python-3.11.9
       repo: https://github.com/GurpreetTech04/face-attendance-app
       plan: free
       region: oregon
