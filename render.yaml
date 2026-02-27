@@ -1,24 +1,16 @@
-services:
-  - type: web
-    name: face-attendance-app
-    runtime: python
-    buildCommand: |
-      apt-get update && apt-get install -y \
-        cmake \
-        build-essential \
-        libx11-dev \
-        libopenblas-dev \
-        liblapack-dev \
-        libjpeg-dev \
-        libpng-dev \
-        libtiff-dev \
-        libgtk-3-dev \
-        libboost-all-dev \
-        && pip install --upgrade pip \
-        && pip install -r requirements.txt
-    startCommand: gunicorn app:app --workers 1 --threads 2 --timeout 120
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9
-      - key: PYTHONUNBUFFERED
-        value: true
+# Exported from Render on 2026-02-27T10:06:16Z
+version: "1"
+projects:
+- name: My project
+  environments:
+  - name: Production
+    services:
+    - type: web
+      name: face-attendance-app
+      runtime: python
+      repo: https://github.com/GurpreetTech04/face-attendance-app
+      plan: free
+      region: oregon
+      buildCommand: pip install -r requirements.txt
+      startCommand: python app.py
+      autoDeployTrigger: commit
